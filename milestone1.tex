@@ -266,24 +266,39 @@ Same V3 source code runs on A40, A100-MIG, H100 --- \textbf{no GPU-specific bran
 \vspace{-0.3em}
 \scriptsize
 \begin{align*}
-h &= \min\!\bigl(1,\; C_{\text{L2}}^{\text{eff}} / W_{\text{conc}}\bigr) \\[3pt]
-L_{\text{eff}} &= h \cdot L_{\text{L2}} + (1{-}h) \cdot L_{\text{DRAM}} \\[3pt]
-T_c &= \max\!\bigl(T_c^{\text{raw}},\; 280\bigr)
+h_{\text{hit}} &= \min\!\bigl(1,\; C_{\text{L2}}^{\text{eff}} \,/\, W_{\text{conc}}\bigr)
+    & & \text{\tiny L2 hit fraction} \\[2pt]
+L_{\text{eff}} &= h_{\text{hit}} \cdot L_{\text{L2}} + (1{-}h_{\text{hit}}) \cdot L_{\text{DRAM}}
+    & & \text{\tiny effective memory latency (cycles)} \\[2pt]
+T_{\text{compute}} &= \max\!\bigl(T_{\text{compute}}^{\text{raw}},\; 280\bigr)
+    & & \text{\tiny per-stage compute window (cycles)}
 \end{align*}
 \end{block}
 
-\vspace{0.3em}
+\vspace{0.2em}
 \begin{block}{\small Predicted Speedup}
 \vspace{-0.5em}
 \[
-\widehat{S} = \frac{\max(T_c,\; L_{\text{eff}})}{\max\!\bigl(T_c,\; L_{\text{eff}}/S\bigr)} \times \left(\frac{\text{Occ}(S)}{\text{Occ}(1)}\right)^{0.15}
+\widehat{S}_{\text{pred}} = \underbrace{\frac{\max(T_{\text{compute}},\; L_{\text{eff}})}{\max\!\bigl(T_{\text{compute}},\; L_{\text{eff}}\,/\,S_{\text{stage}}\bigr)}}_{\text{overlap benefit}} \times \underbrace{\left(\frac{\text{Occ}(S_{\text{stage}})}{\text{Occ}(1)}\right)^{0.15}}_{\text{occupancy penalty}}
 \]
 \end{block}
 
-\vspace{0.3em}
+\vspace{0.1em}
+\scriptsize
+\renewcommand{\arraystretch}{1.0}
+\begin{tabular}{@{}r@{\;=\;}l@{\qquad}r@{\;=\;}l@{}}
+$C_{\text{L2}}^{\text{eff}}$ & effective L2 capacity &
+$L_{\text{L2}}$, $L_{\text{DRAM}}$ & L2 / DRAM latency \\
+$W_{\text{conc}}$ & concurrent working set &
+$S_{\text{stage}}$ & pipeline depth (2,3,4) \\
+$T_{\text{compute}}^{\text{raw}}$ & pure FLOP time per stage &
+$\text{Occ}(S)$ & blocks per SM at depth $S$ \\
+\end{tabular}
+
+\vspace{0.2em}
 \centering
 \scriptsize
-\textbf{All inputs} = arch constants + microbenchmark values.\\
+\textbf{All inputs} = arch constants + microbenchmark values.\;
 \emph{Zero} parameters fitted from kernel data.
 \end{column}
 \end{columns}
