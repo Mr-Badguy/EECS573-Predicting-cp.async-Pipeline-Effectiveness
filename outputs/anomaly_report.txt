@@ -1,0 +1,7 @@
+Top-5 anomalies (l2_mode=effective):
+1. stencil H100_SXM5 size=4194304 S=4 tile=1024 measured=1.220000 pred=2.645751 delta=1.425751 abs=1.425751
+2. stencil A40 size=4194304 S=4 tile=1024 measured=0.990000 pred=2.000000 delta=1.010000 abs=1.010000
+3. stencil H100_SXM5 size=4194304 S=3 tile=1024 measured=1.250000 pred=2.250000 delta=1.000000 abs=1.000000
+4. gemm A40 size=2048 S=4 tile=64 measured=0.950000 pred=0.000000 delta=-0.950000 abs=0.950000
+5. gemm A100_MIG_3g40gb size=2048 S=3 tile=64 measured=1.320000 pred=0.447214 delta=-0.872786 abs=0.872786
+Wrote /gpfs/accounts/eecs570w26s001_class_root/eecs570w26s001_class/xxxchen/project2_cp_async_pipeline/outputs/anomaly_topk.csv
