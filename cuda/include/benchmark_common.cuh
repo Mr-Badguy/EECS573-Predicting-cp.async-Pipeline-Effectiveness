@@ -27,7 +27,7 @@
     }                                                                             \
   } while (0)
 
-inline int ceil_div_int(int x, int y) {
+__host__ __device__ inline int ceil_div_int(int x, int y) {
   return (x + y - 1) / y;
 }
 

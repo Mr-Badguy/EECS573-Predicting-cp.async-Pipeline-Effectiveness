@@ -82,9 +82,14 @@ def main():
         sizes_all = [p[0] for p in pts]
 
         l2_cycles = median(take_quantile_slice(cycles_all, 0.0, 0.30))
-        dram_cycles = median(take_quantile_slice(cycles_all, 0.70, 1.0))
         l2_ns = median(take_quantile_slice(ns_all, 0.0, 0.30))
-        dram_ns = median(take_quantile_slice(ns_all, 0.70, 1.0))
+
+        # Use the last 3 data points (largest arrays) for DRAM latency.
+        # This is more robust than a fixed quantile when most data points
+        # fall within L2 (e.g. L40S with 96 MB L2).
+        n_dram = min(3, len(pts))
+        dram_cycles = median([p[1] for p in pts[-n_dram:]])
+        dram_ns = median([p[2] for p in pts[-n_dram:]])
 
         knee_value = l2_cycles + float(args.threshold) * (dram_cycles - l2_cycles)
         l2_eff_bytes = sizes_all[-1]

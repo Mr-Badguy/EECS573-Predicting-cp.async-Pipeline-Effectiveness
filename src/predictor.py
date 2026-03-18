@@ -111,7 +111,16 @@ def predict_speedup(workload_point, gpu_spec, stage, l2_mode="effective"):
     dram_latency = float(gpu_spec["dram_latency_cycles"])
     l_eff = hit_fraction * l2_latency + (1.0 - hit_fraction) * dram_latency
 
-    t_compute = compute_compute_cycles(workload_point, gpu_spec)
+    t_compute_raw = compute_compute_cycles(workload_point, gpu_spec)
+
+    # Fix 1: Per-stage minimum cycle floor.
+    # Each pipeline stage requires __syncthreads (x2), cp.async commit/wait,
+    # and warp scheduling overhead.  Pure FLOP time alone underestimates the
+    # true per-stage cost for small tiles (e.g. stencil: 28 FLOP-cycles but
+    # ~200+ real cycles per stage).
+    min_stage_cycles = float(gpu_spec.get("min_stage_cycles", 280.0))
+    t_compute = max(t_compute_raw, min_stage_cycles)
+
     if t_compute <= 0:
         s_min = 1
     else:
@@ -119,8 +128,15 @@ def predict_speedup(workload_point, gpu_spec, stage, l2_mode="effective"):
         s_min = max(1, s_min)
 
     hidden_depth = min(stage, s_min)
+
+    # Fix 2: Add per-stage pipeline overhead to pipelined time.
+    # The V3 kernel pays extra instruction cost per stage (cp.async commit,
+    # wait_group, ring-buffer index arithmetic) that the V1 baseline avoids.
+    pipeline_overhead = float(gpu_spec.get("pipeline_overhead_cycles", 0.0))
+    stage_overhead = pipeline_overhead * float(max(0, stage - 1))
+
     numerator = max(t_compute, l_eff)
-    denominator = max(t_compute, l_eff / float(hidden_depth))
+    denominator = max(t_compute, l_eff / float(hidden_depth)) + stage_overhead
 
     overlap_term = numerator / denominator if denominator > 0 else 1.0
     occ_ratio_raw = cur["blocks_per_sm"] / float(base["blocks_per_sm"])

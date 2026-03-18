@@ -52,7 +52,8 @@ std::vector<size_t> default_sizes_bytes() {
   return {
       1 * mb,  2 * mb,  3 * mb,  4 * mb,  6 * mb,  8 * mb,  10 * mb,
       12 * mb, 16 * mb, 20 * mb, 24 * mb, 28 * mb, 32 * mb, 36 * mb,
-      40 * mb,
+      40 * mb, 48 * mb, 56 * mb, 64 * mb, 80 * mb, 96 * mb, 112 * mb,
+      128 * mb,
   };
 }
 
