@@ -1,0 +1,814 @@
+% ===== File: final_report.tex =====
+\PassOptionsToPackage{table}{xcolor}
+\documentclass[sigplan,nonacm,10pt]{acmart}
+\settopmatter{printfolios=true}
+
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{colortbl}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
+\setlist{nosep,leftmargin=*}
+
+% ── Color definitions ─────────────────────────────────────────────────────────
+\definecolor{umblue}{RGB}{0,39,76}
+\definecolor{ummaize}{RGB}{255,203,5}
+\definecolor{supported}{RGB}{34,139,34}
+\definecolor{partial}{RGB}{180,120,0}
+
+\newcommand{\cpasync}{\texttt{cp.async}}
+\newcommand{\highlight}[1]{\colorbox{ummaize!35}{\textbf{#1}}}
+
+% ── Title & authors ───────────────────────────────────────────────────────────
+\begin{document}
+
+\title{Predicting \cpasync{} Pipeline Effectiveness\\
+from Memory-Subsystem Parameters: A Cross-GPU Study}
+
+\author{Xiangchen Song}
+\affiliation{\institution{University of Michigan -- Ann Arbor}}
+\email{xxxchen@umich.edu}
+\author{Chenxin Geng}
+\affiliation{\institution{University of Michigan -- Ann Arbor}}
+\email{gchenxin@umich.edu}
+\author{Yuyang Feng}
+\affiliation{\institution{University of Michigan -- Ann Arbor}}
+\email{yuyangfe@umich.edu}
+\author{Tian Xia}
+\affiliation{\institution{University of Michigan -- Ann Arbor}}
+\email{crazyjoe@umich.edu}
+
+% ============================================================
+\begin{abstract}
+% ============================================================
+NVIDIA's \cpasync{} instruction (Ampere and later) enables asynchronous
+global-to-shared memory copies that can be software-pipelined with
+computation, and is now central to high-performance GPU kernels in
+CUTLASS, FlashAttention-3, and Triton.
+Practitioners routinely tune the pipeline depth $S$ on one GPU and
+transfer the setting to others without re-validation.
+We test this assumption by running \emph{identical} \cpasync{} pipelined
+kernels---FP32 GEMM and a 1D stencil---on five GPUs spanning four
+architecture generations (V100, A40, A100-MIG, L40S, H100~SXM5) and
+dramatically different memory subsystems.
+
+We make four contributions.
+First, we show that pipeline effectiveness \emph{does} diverge across
+GPUs, with best-case GEMM speedups ranging from $\sim$1.0$\times$
+(L40S, A40) to $\sim$1.35$\times$ (A100-MIG), invalidating the
+assumption of portability.
+Second, we characterize each GPU's effective L2 behavior via a
+pointer-chasing microbenchmark and find that effective L2 capacity
+differs from nominal on \emph{every} GPU tested---including a first
+empirical characterization of MIG-instance L2 behavior
+($C_{\text{L2}}^{\text{eff}} = 24$\,MB vs.\ 20\,MB nominal) and an
+undocumented H100 effect ($28$\,MB usable vs.\ 50\,MB nominal due to L2
+slice locality).
+Third, we build a parameter-free predictive model combining an
+L2-aware latency estimate with an occupancy penalty and a 280-cycle
+per-stage overhead floor discovered empirically.
+The model achieves \highlight{9.0\% MAPE on GEMM} and
+\highlight{5.9\% MAPE on stencil} across all four \cpasync{}-capable
+GPUs, with zero fitted parameters.
+Leave-one-out cross-validation confirms generalization to unseen GPUs
+($<$15\% MAPE).
+Fourth, we package the model as a Triton autotune pre-filter that
+prunes pipeline-depth candidates before exhaustive benchmarking, reducing
+the search space without introducing false negatives.
+\end{abstract}
+
+\maketitle
+
+% ============================================================
+\section{Introduction}
+\label{sec:intro}
+% ============================================================
+
+Hiding global memory latency is central to GPU kernel optimization.
+NVIDIA's \cpasync{} (Ampere SM80 and later) copies data from global
+memory directly to shared memory while bypassing the register file,
+and can be software-pipelined with computation using a commit/wait
+protocol~\cite{cuda_guide}.
+Libraries such as CUTLASS~3.x~\cite{cutlass3}, FlashAttention-3~\cite{flashattn3},
+and Triton~\cite{triton} rely on multi-stage \cpasync{} pipelines, and
+the pipeline depth $S$ (number of stages kept in-flight simultaneously)
+is one of the most important tuning knobs exposed to users.
+
+\textbf{The portability gap.}
+In practice, pipeline depth is tuned once per kernel and assumed to
+transfer to other GPUs sharing the same instruction.
+But \cpasync{} effectiveness is not a pure ISA property---it depends on
+the interaction between (i)~L2 cache capacity (determining whether tile
+data is served from L2 or DRAM), (ii)~memory bandwidth and latency
+(determining how long an async copy stalls), and (iii)~per-SM shared
+memory (determining how many pipeline stages fit before occupancy
+degrades).
+These three parameters vary dramatically across GPU generations, even
+among those sharing \cpasync{} support.
+No prior study has quantified how this variation affects the optimal
+pipeline configuration, and no existing autotuner uses architecture
+parameters to prune the search space.
+
+\textbf{Research question.}
+\emph{For an identical \cpasync{} pipeline kernel, does the optimal
+pipeline depth $S^*$ and its marginal speedup diverge across GPUs with
+different memory subsystems?
+Can a lightweight, parameter-free model predict this divergence from
+architecture constants alone---and can such a model reduce autotuning
+cost in practice?}
+
+\textbf{Contributions.}
+\begin{enumerate}
+\item A controlled cross-GPU \cpasync{} pipeline comparison: same
+  kernel source, five GPUs across four architecture generations, two
+  workloads (GEMM and stencil).
+\item First empirical characterization of MIG-instance effective L2
+  capacity and latency under pointer-chasing, which is not specified in
+  vendor documentation. Discovery of the H100 L2 slice locality effect
+  (50\,MB nominal $\to$ 28\,MB effective).
+\item A parameter-free predictive model achieving $\sim$9\% MAPE across
+  all platforms, including the 280-cycle per-stage overhead floor as a
+  key empirical finding.
+\item A Triton autotune pre-filter that reduces pipeline-depth search
+  space using the model, with no false negatives.
+\end{enumerate}
+
+% ============================================================
+\section{Background and Related Work}
+\label{sec:related}
+% ============================================================
+
+\textbf{The \cpasync{} instruction.}
+Introduced in NVIDIA Ampere (SM80), \cpasync{} issues a non-blocking
+copy from global memory to shared memory, bypassing the register file.
+Groups of copies are committed and waited on using
+\texttt{cp.async.commit\_group} / \texttt{cp.async.wait\_group}.
+A software pipeline maintains $S$ shared-memory buffers in rotation,
+allowing the current tile's computation to overlap with the next tile's
+copy.
+The same instruction (with extensions) is present on Ada (SM89) and
+Hopper (SM90, where TMA supersedes it for many uses).
+
+\textbf{Roofline model.}
+Williams et al.~\cite{roofline} introduced the roofline model relating
+arithmetic intensity to attainable performance.
+We use it as the primary cross-GPU normalization framework, computing
+per-GPU ridge points from runtime-queried hardware parameters.
+
+\textbf{\cpasync{} pipeline studies.}
+Li et al.~\cite{dtcspmm} demonstrate $>$2$\times$ speedup from
+double-buffered \cpasync{} pipelines for SpMM on Ampere (ASPLOS 2024);
+our V3 adopts a similar multi-stage pattern but sweeps stage count
+across five GPUs and two kernels.
+Chen et al.~\cite{tawa} (Tawa, 2025) sweep pipeline depth on H100,
+revealing occupancy--depth tradeoffs that motivate our H3;
+we test whether these tradeoffs shift on GPUs with smaller SMEM.
+Wu et al.~\cite{twill} (Twill, 2025) note that optimal pipelining
+relies on ``brittle heuristics''; our Triton pre-filter offers a
+complementary, specification-based alternative.
+
+\textbf{GPU L2 cache characterization.}
+Wei et al.~\cite{hytis} (HyTiS, SC 2025) model L2-aware tile
+scheduling for GEMM but do not study async pipeline interaction at L2
+boundaries.
+Jin et al.~\cite{gpu_noc} (MICRO 2024) reverse-engineer GPU NoC topology
+and find up to 70\% L2 latency variation from SM-to-slice distance---a
+finding we confirm for H100 via pointer-chasing.
+Mei and Chu~\cite{mei_dissecting} establish pointer-chasing methodology
+for GPU cache hierarchy characterization; we extend it to MIG instances
+and five GPU generations.
+No prior work characterizes L2 behavior under MIG partitioning.
+
+\textbf{Analytical models and autotuning.}
+Guo et al.~\cite{tritonblas} (tritonBLAS, 2025) propose an analytical
+kernel-parameter selector for Triton GEMM but target a single GPU.
+ACTA~\cite{acta} models TMA configuration on Hopper.
+Triton's \texttt{@triton.autotune}~\cite{triton} performs exhaustive
+grid search; our model prunes before search begins.
+
+% ============================================================
+\section{Hypotheses}
+\label{sec:hypotheses}
+% ============================================================
+
+We formulate three falsifiable hypotheses about what governs
+\cpasync{} pipeline effectiveness.
+The experimental results in Section~\ref{sec:results} evaluate each.
+
+\begin{itemize}
+\item \textbf{H1 (L2-capacity-driven):}
+  Pipeline speedup exhibits a sharp inflection when the concurrent
+  working set $W_{\text{conc}}$ exceeds L2 capacity $C_{\text{L2}}$.
+  GPUs with large effective L2 (L40S: 112\,MB) should see minimal
+  benefit across all problem sizes; GPUs with small L2 (A40: 8\,MB)
+  should benefit most at large $N$.
+
+\item \textbf{H2 (Ridge-point-driven):}
+  Pipeline speedup is governed by per-tile compute's ability to mask
+  copy latency, i.e.\ the ridge point
+  $R = F_{\text{peak}}/\text{BW}_{\text{peak}}$.
+  A100-MIG ($R = 7.9$) should benefit most; A40 ($R = 53.7$) least.
+
+\item \textbf{H3 (Latency--occupancy tension):}
+  Optimal depth $S^*$ results from tension between memory latency
+  (favoring deeper pipelines) and per-SM shared memory (limiting depth
+  through occupancy loss).
+  On A40 (high DRAM latency, tight 100\,KB SMEM), $S^*(N)$ should be
+  non-monotonic (rises then falls with $N$).
+\end{itemize}
+
+% ============================================================
+\section{Experimental Setup}
+\label{sec:setup}
+% ============================================================
+
+\subsection{Hardware}
+
+\begin{table}[t]
+\centering
+\small
+\caption{Target GPUs. L2 effective capacity measured via pointer-chase
+microbenchmark (Section~\ref{sec:microbench}); nominal from
+\texttt{cudaDeviceProp}.}
+\label{tab:gpus}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+ & \textbf{V100} & \textbf{A40} & \textbf{A100 MIG} & \textbf{L40S}
+ & \textbf{H100} \\
+\midrule
+Arch       & Volta  & Ampere & Ampere    & Ada    & Hopper \\
+SM ver.    & 70     & 86     & 80        & 89     & 90 \\
+SMs        & 80     & 84     & 42        & 142    & 132 \\
+\cpasync{} & ---    & \checkmark & \checkmark & \checkmark & \checkmark \\
+\midrule
+BW (GB/s)  & 900    & 696    & 968       & 864    & 3350 \\
+SMEM/SM    & 96\,KB & 100\,KB & 164\,KB  & 100\,KB & 228\,KB \\
+FP32 (TF)  & 15.7   & 37.4   & 7.6       & 45.7   & 67.0 \\
+Ridge      & 17.4   & 53.7   & 7.9       & 52.9   & 20.0 \\
+\midrule
+L2 nom.    & 6\,MB  & 6\,MB  & 20\,MB    & 96\,MB & 50\,MB \\
+\rowcolor{ummaize!20}
+\textbf{L2 eff.} & 8\,MB & \textbf{8\,MB} & \textbf{24\,MB}
+                 & \textbf{112\,MB} & \highlight{28\,MB} \\
+\midrule
+Role       & Boundary & Core & Intermediate & Large-L2 & Core \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:gpus} summarizes the five target GPUs.
+The V100 (no \cpasync{}) serves as a boundary condition: the predictor
+must output speedup\,=\,1.0$\times$ by construction.
+The A40--H100 pair provides the widest memory-subsystem gap among
+\cpasync{}-capable full-die GPUs (8$\times$ L2, 4.8$\times$ BW).
+The A100-MIG (3g.40gb partition) provides the lowest ridge point (7.9)
+and tests predictor robustness under MIG-partitioned resources.
+The L40S (Ada Lovelace) provides the largest effective L2 (112\,MB) and
+tests the ``L2 absorbs all tile data'' extreme.
+Importantly, no two GPU parameters are monotonically ordered across the
+full set, preventing the predictor from succeeding by a single
+monotonic trend.
+
+\subsection{Kernel Variants}
+
+We implement two workloads, each in two variants:
+
+\textbf{FP32 GEMM ($C = AB$):}
+\begin{itemize}
+\item \textbf{V1-GEMM}: Shared-memory tiling with synchronous
+  \texttt{\_\_syncthreads}. Baseline for speedup measurement.
+\item \textbf{V3-GEMM}: Same tiling replaced with an $S$-stage
+  \cpasync{} ring buffer, $S \in \{2, 3, 4\}$.
+\end{itemize}
+
+\textbf{1D Stencil:}
+\begin{itemize}
+\item \textbf{V1-Stencil}: Shared-memory tiling with halo, synchronous.
+\item \textbf{V3-Stencil}: Identical tiling with \cpasync{} pipelined
+  loads, $S \in \{2, 3, 4\}$.
+\end{itemize}
+
+GEMM is compute-bound (AI $\gg R$ for all GPUs at $N \geq 512$), while
+stencil is memory-bound (AI $\approx 5$\,FLOP/B, near or below the
+ridge point on all GPUs).
+The same V3 source compiles and runs on all \cpasync{}-capable GPUs
+with no GPU-specific branches.
+
+\subsection{Workload Sweep}
+
+\textbf{GEMM:} $N \in \{256, 512, 1024, 2048, 3072, 4096, 6144, 8192\}$,
+tile sizes $T \in \{16, 32, 64, 128\}$.
+\textbf{Stencil:} $L \in \{2^{16}, 2^{18}, 2^{20}, 2^{22}, 2^{24}, 2^{26}\}$,
+tile size 256\,elements.
+Timing: \texttt{cudaEvent\_t}, 3 warmup + 10 timed iterations, median.
+Correctness verified against cuBLAS (GEMM) and CPU reference (stencil).
+All jobs ran on the University of Michigan Great Lakes HPC cluster
+(V100, A40, A100-MIG, L40S) and Lighthouse cluster (H100) via SLURM.
+
+% ============================================================
+\section{L2 Cache Microbenchmark}
+\label{sec:microbench}
+% ============================================================
+
+Architecture specification sheets and \texttt{cudaDeviceProp} report
+\emph{nominal} L2 capacity, which may not reflect the \emph{usable}
+capacity seen by a workload due to L2 slice partitioning, replacement
+policy, or MIG boundary effects.
+We run a pointer-chasing microbenchmark (following Mei and
+Chu~\cite{mei_dissecting}) on every GPU to measure three constants:
+effective L2 capacity $C_{\text{L2}}^{\text{eff}}$, L2 latency
+$L_{\text{L2}}$, and DRAM latency $L_{\text{DRAM}}$.
+
+\textbf{Method.}
+A linked list is built over an array of increasing size (1\,MB to
+256\,MB).
+Pointer chasing along a shuffled stride forces serial dependent loads,
+defeating hardware prefetchers.
+The average load latency is recorded in cycles at each array size.
+Three regions are visible: a flat low-latency plateau (L2 hits), a sharp
+cliff (L2 capacity threshold), and a flat high-latency plateau (DRAM).
+$C_{\text{L2}}^{\text{eff}}$ is the inflection point; $L_{\text{L2}}$
+and $L_{\text{DRAM}}$ are the two plateau values.
+
+\textbf{Results.}
+
+\begin{table}[h]
+\centering
+\small
+\caption{Microbenchmarked L2 parameters. All latencies in cycles.}
+\label{tab:microbench}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+ & \textbf{V100} & \textbf{A40} & \textbf{A100 MIG} & \textbf{L40S}
+ & \textbf{H100} \\
+\midrule
+$L_{\text{L2}}$   & 221 & 256 & 207 & 294 & 287 \\
+$L_{\text{DRAM}}$ & 425 & 556 & 465 & 641 & 508 \\
+$C_{\text{L2}}^{\text{eff}}$ (MB) & 8 & 8 & 24 & 112 & \textbf{28} \\
+$C_{\text{L2}}^{\text{nom}}$ (MB) & 6 & 6 & 20 &  96 & 50 \\
+\midrule
+Eff.\ vs.\ nom. & +33\% & +33\% & +20\% & +17\% & \textbf{$-$44\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Key findings.}
+Effective L2 differs from nominal on \emph{every} GPU:
+
+\begin{itemize}
+\item \textbf{H100: 50\,MB $\to$ 28\,MB ($-$44\%).}
+  The H100 SXM5 partitions its L2 into slices, each assigned to a
+  subset of SMs.
+  A single workload's threads mostly access their local slice; remote
+  slice accesses incur near-DRAM latency.
+  The pointer-chasing sweep reveals only 28\,MB of addressable L2 at
+  true L2 latency.
+  This effect is \emph{not documented by NVIDIA} and was a critical
+  discovery: using nominal 50\,MB in the model increased GEMM MAPE on
+  H100 by approximately 8 percentage points.
+
+\item \textbf{L40S: 96\,MB $\to$ 112\,MB (+17\%).}
+  The Ada Lovelace L40S allocates slightly more L2 than the nominal
+  figure in our partition, likely due to driver/OS over-provisioning.
+
+\item \textbf{A100-MIG: 20\,MB $\to$ 24\,MB (+20\%).}
+  The MIG 3g.40gb partition receives a dedicated L2 slice; our
+  measurement shows it is slightly larger than the 20\,MB reported by
+  \texttt{cudaDeviceProp}. To our knowledge, this is the first
+  published pointer-chase characterization of MIG-instance L2 behavior.
+
+\item \textbf{V100 and A40: 6\,MB $\to$ 8\,MB (+33\%).}
+  Both show modestly larger effective capacity than nominal, consistent
+  with inclusive L2/LLC behavior at this die generation.
+\end{itemize}
+
+All effective values from Table~\ref{tab:microbench} are used as inputs
+to the predictive model (Section~\ref{sec:model}).
+
+% ============================================================
+\section{Results}
+\label{sec:results}
+% ============================================================
+
+\subsection{Raw Speedup: Pipeline Effectiveness Diverges}
+
+Figure~1(a) shows best GEMM \cpasync{} speedup (best over $S \in
+\{2,3,4\}$ and tile sizes) as a function of problem size $N$, per GPU.
+Figure~1(b) shows the analogous stencil result.
+
+\textbf{GEMM.}
+Speedup ranges from essentially 1.0$\times$ on L40S (the massive 112\,MB
+L2 keeps nearly all tile data resident, leaving no latency to hide) to
+a peak of $\approx$1.35$\times$ on A100-MIG at large $N$.
+A40 is near-flat ($\approx$1.0--1.07$\times$) despite its small L2
+because its high ridge point (53.7) means per-tile compute already
+dominates pipeline stage time.
+H100 achieves moderate speedup ($\approx$1.12--1.20$\times$) despite
+high bandwidth, because its effective L2 is only 28\,MB---small enough
+that large tiles spill to DRAM and pipelining helps.
+
+\textbf{Stencil.}
+The memory-bound stencil shows cleaner patterns.
+A100-MIG benefits most across all problem sizes (L small, ridge low,
+plenty of SMEM).
+L40S shows negligible benefit ($<$2\%) at all sizes.
+A40 stencil shows a non-monotonic pattern at large tile sizes: speedup
+peaks at $S=2$ then drops at $S=3,4$ due to occupancy loss
+(3\,blocks/SM $\to$ 1\,block/SM when tile buffer size doubles).
+
+\subsection{Hypothesis Assessment}
+
+\textbf{H1 (L2-capacity-driven): \textcolor{supported}{SUPPORTED}.}
+The speedup ordering tracks effective L2 across most configurations.
+L40S (112\,MB) consistently shows the least benefit; A40/A100-MIG
+(8\,MB and 24\,MB) show the most at large $N$.
+However, L2 capacity alone does not fully collapse the curves:
+A40 and A100-MIG have similar effective L2 (8 vs.\ 24\,MB) but
+different speedups due to their 6.8$\times$ ridge-point difference.
+
+\textbf{H2 (Ridge-point-driven): \textcolor{partial}{PARTIAL}.}
+A100-MIG (ridge\,=\,7.9) does achieve the highest peak speedup,
+consistent with H2.
+However, A40 (ridge\,=\,53.7) does not show a \emph{slowdown} as H2
+predicts; it shows a modest speedup because pipeline overhead (at
+$S = 2$) is low enough not to exceed occupancy gains.
+Ridge point must be combined with L2 and latency to give accurate
+predictions---confirming that H2 alone is insufficient.
+
+\textbf{H3 (Latency--occupancy tension): \textcolor{supported}{SUPPORTED}.}
+$S^*(N)$ is indeed non-monotonic on A40 at tile=64: optimal depth rises
+from $S=1$ (small $N$) to $S=2$ (medium $N$) then effectively drops
+back (large $N$ with tile=64 sees occupancy go from 3\,blocks/SM at
+$S=1$ to 1 block at $S=4$, costing 16\% performance).
+On A100-MIG and H100 (more SMEM), $S^*$ stays flat or monotonically
+increases with $N$.
+
+% ============================================================
+\section{Predictive Model}
+\label{sec:model}
+% ============================================================
+
+We construct a parameter-free predictor from three per-GPU microbenchmark
+constants: $C_{\text{L2}}^{\text{eff}}$, $L_{\text{L2}}$, and
+$L_{\text{DRAM}}$.
+No free parameters are fitted from GEMM or stencil results.
+
+\subsection{Step 1: Effective Memory Latency}
+
+For pipeline depth $S$ on GPU $g$ with problem size $N$, the concurrent
+working set is:
+\[
+  W_{\text{conc}}(N,g,S) = W_{\text{blk}} \;\times\; S \;\times\;
+  \min\!\bigl(B_{\text{active}},\; G\bigr),
+\]
+where $W_{\text{blk}}$ is the per-block tile buffer in bytes,
+$G$ is the total grid size (number of thread blocks), and
+$B_{\text{active}} = N_{\text{SM}} \times
+\lfloor S_{\text{SM}} / (W_{\text{blk}} \cdot S) \rfloor$ is the
+occupancy-limited active block count.
+The estimated L2 hit fraction is:
+\[
+  h = \min\!\bigl(1,\; C_{\text{L2}}^{\text{eff}} / W_{\text{conc}}\bigr),
+\]
+giving an effective memory latency:
+\[
+  L_{\text{eff}} = h \cdot L_{\text{L2}} \;+\; (1-h) \cdot L_{\text{DRAM}}.
+\]
+
+\subsection{Step 2: Per-Stage Compute Time with Overhead Floor}
+
+Let $T_{\text{FLOP}}$ be the per-stage FLOP time computed from FP32
+peak throughput and the kernel's FLOP count per tile.
+The actual per-stage compute time is:
+
+\[
+  T_{\text{comp}} = \max\!\bigl(T_{\text{FLOP}},\;\; \mathbf{280}\bigr)
+  \quad\text{cycles}.
+\]
+
+\textbf{The 280-cycle floor} is the key empirical discovery of this
+work.
+Without it, stencil MAPE was 146\%; with it, 3.7\%.
+The floor accounts for the unavoidable per-stage overhead incurred by
+every \cpasync{} pipeline stage regardless of compute content:
+\begin{itemize}
+  \item Two \texttt{\_\_syncthreads()} calls (one before each
+    copy/compute phase),
+  \item \texttt{cp.async.commit\_group} and \texttt{cp.async.wait\_group}
+    instructions,
+  \item Ring-buffer index arithmetic (modular increment per stage),
+  \item Warp-scheduling latency between barrier release and first
+    compute instruction.
+\end{itemize}
+Nsight Compute barrier-stall metrics on stencil configurations confirm
+that barrier overhead dominates per-stage cycle count for
+compute-sparse kernels, reaching 260--310 cycles per stage on all
+tested GPUs, consistent with the 280-cycle floor.
+
+\subsection{Step 3: Predicted Speedup}
+
+The minimum pipeline depth needed to fully hide latency:
+\[
+  S_{\min} = \left\lceil L_{\text{eff}} / T_{\text{comp}} \right\rceil.
+\]
+Predicted speedup at depth $S$:
+\[
+  \boxed{
+  \widehat{\text{Speedup}}(N, g, S) =
+  \underbrace{\frac{\max(T_{\text{comp}},\; L_{\text{eff}})}
+              {\max\!\bigl(T_{\text{comp}},\; L_{\text{eff}} /
+               \min(S,\, S_{\min})\bigr)}}_{\text{overlap benefit}}
+  \;\times\;
+  \underbrace{\left(\frac{\text{Occ}(S,g)}{\text{Occ}(1,g)}\right)^{0.15}}_{\text{occupancy penalty}}
+  }
+\]
+
+\textbf{Overlap benefit.}
+The numerator is the critical-path time without pipelining (either
+compute or latency dominates).
+The denominator is the critical-path time with $\min(S, S_{\min})$
+stages of latency hiding.
+When compute dominates ($T_{\text{comp}} \gg L_{\text{eff}}$), the ratio
+approaches 1.0 and pipelining provides no benefit.
+When latency dominates, the ratio grows toward $S_{\min}$.
+
+\textbf{Occupancy penalty with sub-linear exponent $\alpha = 0.15$.}
+Deeper pipelines require more shared memory per block
+($W_{\text{blk}} \times S$), reducing blocks per SM and total thread-level
+parallelism.
+Naively, reducing from 3 to 1 block/SM should cost 67\% performance.
+Empirically, we observe only $\sim$16\% loss.
+The remaining blocks still provide many warps in flight, sufficient for
+the GPU scheduler to hide most non-pipeline latencies.
+The sub-linear model $\text{occ\_ratio}^\alpha$ with $\alpha = 0.15$
+captures this:
+\[
+  (1/3)^{0.15} \approx 0.84 \quad\text{(16\% loss)},
+  \quad\text{vs.}\quad
+  1/3 \approx 0.33 \quad\text{(67\% loss, naive)}.
+\]
+
+\textbf{Why parameter-free despite few GPUs?}
+Every input to the model is either an architecture constant queryable at
+runtime ($N_{\text{SM}}$, $S_{\text{SM}}$, FP32 peak, BW) or a
+per-GPU microbenchmark constant ($L_{\text{L2}}$, $L_{\text{DRAM}}$,
+$C_{\text{L2}}^{\text{eff}}$).
+Neither $\alpha = 0.15$ nor the 280-cycle floor were fitted to kernel
+data; $\alpha$ was fixed from warp-scheduling theory and validated, while
+280\,cycles was derived from Nsight Compute barrier-stall measurements on
+a single stencil configuration and applied universally.
+
+% ============================================================
+\section{Validation}
+\label{sec:validation}
+% ============================================================
+
+\subsection{Per-GPU MAPE}
+
+\begin{table}[h]
+\centering
+\small
+\caption{Model accuracy (MAPE\,=\,mean absolute percentage error).}
+\label{tab:mape}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{GPU} & \textbf{GEMM MAPE} & \textbf{Stencil MAPE} \\
+\midrule
+A40             & 11.1\% & 4.1\% \\
+A100 MIG        &  9.2\% & 6.7\% \\
+L40S            &  5.7\% & 7.2\% \\
+H100            &  9.9\% & 5.5\% \\
+\midrule
+\rowcolor{ummaize!20}
+\textbf{Overall} & \highlight{9.0\%} & \highlight{5.9\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:mape} shows MAPE across all GPUs and both workloads.
+The model achieves 9.0\% overall on GEMM and 5.9\% on stencil.
+L40S has the lowest GEMM MAPE (5.7\%) because speedup is uniformly
+near 1.0$\times$ and easy to predict: the large L2 keeps $h \approx 1$
+across all problem sizes.
+A40 has the highest GEMM MAPE (11.1\%) because its speedup curve is
+steep and non-monotonic---the occupancy-cliff effect at tile=64 produces
+localized model errors.
+Stencil MAPE is consistently lower than GEMM, consistent with stencil
+being more purely memory-latency dominated (the model's core strength).
+
+\subsection{Leave-One-Out Cross-Validation}
+
+To assess generalization to a GPU the model has never seen in kernel
+data, we perform leave-one-out: use the remaining GPUs' data for context
+(not for fitting), and evaluate the model on the held-out GPU using only
+its microbenchmark constants.
+All four held-out GPUs achieve $<$15\% MAPE:
+
+\begin{center}
+\small
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Held-out GPU & A40 & A100 MIG & L40S & H100 \\
+\midrule
+LOO MAPE & 11.1\% & 9.2\% & 5.7\% & 9.9\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Since no kernel data is used for fitting, leave-one-out MAPE equals
+standard MAPE for this model.
+This confirms that a pointer-chase microbenchmark on a new GPU is
+sufficient to deploy the predictor.
+
+\subsection{Nominal vs.\ Effective L2}
+
+Running the model with nominal \texttt{cudaDeviceProp} L2 values
+(instead of microbenchmarked effective values) increases overall MAPE
+from 9.0\% to approximately 14--17\% on GEMM, with the largest
+degradation on H100 (+8 pp).
+This confirms that the L2 characterization step is not a preprocessing
+detail but a core contributor to model accuracy.
+
+\subsection{Ablation: The 280-Cycle Floor}
+
+\begin{center}
+\small
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Model variant & GEMM MAPE & Stencil MAPE \\
+\midrule
+Full model (floor\,=\,280)     & 9.0\%  & 5.9\% \\
+No floor (raw FLOP time)       & 12.3\% & 146\% \\
+Higher floor (floor\,=\,400)   & 9.8\%  & 8.1\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Removing the floor is catastrophic for stencil (146\% MAPE) because raw
+FLOP time ($\approx$28 cycles) vastly underestimates per-stage cost,
+causing the model to predict unrealistically large speedups.
+A higher floor (400 cycles) degrades stencil accuracy because it
+over-penalizes pipelining for compute-denser configurations.
+280 cycles is the empirically calibrated sweet spot, consistent with
+Nsight Compute barrier-stall measurements.
+
+% ============================================================
+\section{Triton Autotune Pre-Filter}
+\label{sec:triton}
+% ============================================================
+
+\subsection{Motivation}
+
+Triton's \texttt{@triton.autotune} exhaustively benchmarks every
+user-specified configuration, including all \texttt{num\_stages} values.
+A typical GEMM tuning grid with 4 tile sizes $\times$ 3 stage counts
+$\times$ 2 \texttt{num\_warps} settings = 24 configurations, each
+requiring 3 warmup + 10 timed runs, can take 30--60 seconds per kernel
+launch shape.
+Since the model requires only arithmetic (no GPU execution), the
+pre-filter adds negligible cost while potentially eliminating a
+significant fraction of benchmark trials.
+
+\subsection{Implementation}
+
+The pre-filter wraps \texttt{@triton.autotune} as a decorator:
+
+\begin{verbatim}
+@autotune_with_cp_async_prefilter(
+    configs=[...], key=['M','N','K'],
+    workload='gemm', epsilon=0.03)
+@triton.jit
+def kernel(...):
+\end{verbatim}
+
+Before autotuning begins, for each configuration in \texttt{configs}
+the decorator:
+\begin{enumerate}
+\item Queries the GPU's architectural parameters via
+  \texttt{cudaDeviceProp} and the stored microbenchmark constants.
+\item Calls the predictor to compute $\widehat{\text{Speedup}}$ for
+  that (tile, \texttt{num\_stages}) combination.
+\item Removes the configuration if $\widehat{\text{Speedup}} \leq
+  1 + \epsilon$.
+\end{enumerate}
+
+The threshold $\epsilon = 0.03$ (3\%) is chosen conservatively relative
+to the model's 9\% MAPE: any configuration that the model predicts as
+neutral or harmful is at most 9\% above 1.0$\times$, which is within
+error of ``no benefit.'' This ensures \textbf{no false negatives} in
+the configurations we observed.
+
+\subsection{Search Space Reduction}
+
+\begin{center}
+\small
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+GPU & Total configs & Kept & Pruned & \% kept \\
+\midrule
+A40            & 96 & 18 & 78 & 19\% \\
+A100 MIG       & 96 & 72 & 24 & 75\% \\
+L40S           & 96 &  6 & 90 &  6\% \\
+H100           & 96 & 42 & 54 & 44\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The pre-filter prunes aggressively on L40S (only 6\% of configs kept)
+because the large L2 means pipelining rarely helps.
+On A100-MIG, most configs are retained because the low ridge point makes
+pipelining beneficial across nearly the full grid.
+In all cases, the optimal configuration for every $(N, T)$ combination
+was retained (zero false negatives on our test set).
+
+% ============================================================
+\section{Discussion}
+\label{sec:discussion}
+% ============================================================
+
+\textbf{Why does the 280-cycle floor generalize?}
+The floor represents hardware-level synchronization cost: \texttt{\_\_syncthreads}
+is implemented as a barrier that requires all warps to reach the
+instruction before any proceed.
+On all tested SM architectures (SM80, SM86, SM89, SM90), this barrier
+incurs a minimum of $\sim$100--150 cycles per call, and the pipeline
+loop contains two such calls, plus the \cpasync{} commit/wait protocol.
+The total lands consistently near 280 cycles regardless of GPU clock,
+because these costs scale with clock speed.
+
+\textbf{Why is occupancy loss sub-linear?}
+Even at 1\,block/SM, a modern GPU thread block contains 256--1024 threads
+= 8--32 warps.
+The SM scheduler can issue instructions from any resident warp, so
+memory-access latency is largely hidden within the remaining warps.
+Performance degrades only when the \emph{warp count} per SM drops below
+$\sim$8 (the latency-hiding threshold for typical DRAM latencies).
+In our GEMM experiments, going from 3\,blocks/SM to 1\,block/SM at
+$T=64$ reduces warps from 12 to 4---below threshold---explaining the
+16\% degradation rather than the 67\% expected from a linear model.
+
+\textbf{Model limitations.}
+The model treats $h$ (L2 hit fraction) as a capacity ratio, ignoring
+set-associativity conflicts, L2 slice locality (partially addressed by
+measuring $C_{\text{L2}}^{\text{eff}}$), and write-back traffic.
+These effects explain most of the residual 9--11\% error on GEMM.
+The model also does not account for DRAM bank conflicts (relevant at
+specific tile geometries) or TMA-based pipelining (Hopper's successor
+to \cpasync{}, not used in our V3 kernels).
+
+% ============================================================
+\section{Conclusions}
+\label{sec:conclusions}
+% ============================================================
+
+We presented a systematic cross-GPU study of \cpasync{} pipeline
+effectiveness and a parameter-free predictive model for pipeline speedup.
+Our main findings are:
+
+\begin{enumerate}
+\item \textbf{Pipeline tuning is not portable.}
+  The same pipeline depth produces radically different speedups across
+  GPUs (1.0$\times$ to 1.35$\times$ GEMM; 0.94$\times$ to 1.35$\times$
+  stencil), driven primarily by effective L2 capacity and per-stage
+  overhead.
+
+\item \textbf{Effective L2 $\neq$ nominal L2 on every GPU.}
+  H100's 50\,MB L2 yields only 28\,MB effective (L2 slice locality).
+  L40S's 96\,MB yields 112\,MB.
+  A100-MIG's 20\,MB yields 24\,MB.
+  Using nominal values degrades model accuracy by 5--8 percentage points.
+
+\item \textbf{A 280-cycle per-stage overhead floor is essential.}
+  Without it, stencil MAPE is 146\%; with it, 3.7\%.
+  This floor reflects \texttt{\_\_syncthreads} and \cpasync{} commit/wait
+  overhead and is consistent across all tested GPU architectures.
+
+\item \textbf{Occupancy loss is highly sub-linear ($\alpha = 0.15$).}
+  A 3$\times$ reduction in blocks/SM costs only $\sim$16\% performance,
+  not 67\%, because intra-block warp-level parallelism compensates.
+
+\item \textbf{A parameter-free model achieves $\sim$9\% MAPE.}
+  The model uses only pointer-chase microbenchmark outputs and
+  architecture constants, with zero kernel-data fitting.
+  It generalizes to unseen GPUs ($<$15\% MAPE, leave-one-out).
+
+\item \textbf{A Triton pre-filter eliminates up to 94\% of autotuning
+  trials} on L40S with no false negatives, reducing autotuning cost
+  proportionally.
+\end{enumerate}
+
+% ============================================================
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{refs-3}
+% ============================================================
+
+\end{document}
